@@ -17,6 +17,7 @@ import {
 
 const POLL_MS = 2_000;
 const HTTP_TIMEOUT_MS = 120_000;
+const ASK_MAX_TOKENS = 16_384;
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -145,9 +146,8 @@ export default async function plugin(bb: BbPluginApi) {
       prompt: z.string().min(1).max(200_000),
       model: z.string().optional().describe("A route_ask model name from this thread's instructions. Default: the first one."),
       system: z.string().max(8_000).optional(),
-      maxTokens: z.number().int().min(16).max(32_000).optional(),
     }),
-    async execute({ prompt, model, system, maxTokens }, { signal }) {
+    async execute({ prompt, model, system }, { signal }) {
       const config = await settings.get();
       const models = parseModels(config.askModels);
       const entry = model ? models.find((m) => m.name === model) : models[0];
@@ -162,11 +162,20 @@ export default async function plugin(bb: BbPluginApi) {
       const body = (await post(
         `${config.askBaseUrl.trim().replace(/\/+$/, "")}/chat/completions`,
         config.askApiKey,
-        { model: entry.model, messages, max_tokens: maxTokens ?? 4_096, stream: false },
+        // A fixed, generous cap: reasoning models spend tokens before they answer, so an
+        // agent-chosen small limit (e.g. 60 for "one line") returns an empty reply.
+        { model: entry.model, messages, max_tokens: ASK_MAX_TOKENS, stream: false },
         signal,
-      )) as { choices?: { message?: { content?: string | null } }[] };
-      const content = body.choices?.[0]?.message?.content;
-      if (!content) throw new Error(`${entry.model} returned no text`);
+      )) as { choices?: { finish_reason?: string; message?: { content?: string | null } }[] };
+      const choice = body.choices?.[0];
+      const content = choice?.message?.content;
+      if (!content) {
+        throw new Error(
+          choice?.finish_reason === "length"
+            ? `${entry.model} used its ${ASK_MAX_TOKENS}-token limit before it answered`
+            : `${entry.model} returned no text`,
+        );
+      }
       return `[${entry.model}]\n${truncate(content)}`;
     },
   });
